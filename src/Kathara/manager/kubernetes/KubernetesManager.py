@@ -353,6 +353,42 @@ class KubernetesManager(IManager):
             logging.debug("Waiting for namespace deletion...")
             self.k8s_namespace.undeploy(lab_hash=lab_hash)
 
+    def save_lab(self, archive_path: str, lab_hash: Optional[str] = None, lab_name: Optional[str] = None,
+                 lab: Optional[Lab] = None, selected_machines: Optional[Set[str]] = None,
+                 excluded_machines: Optional[Set[str]] = None) -> None:
+        """Save the state of a running network scenario into a single archive file.
+
+        Args:
+            archive_path (str): The path of the archive file to create.
+            lab_hash (Optional[str]): The hash of the network scenario.
+            lab_name (Optional[str]): The name of the network scenario.
+            lab (Optional[Kathara.model.Lab]): The network scenario object.
+            selected_machines (Optional[Set[str]]): If not None, save only the specified devices.
+            excluded_machines (Optional[Set[str]]): If not None, exclude devices from being saved.
+
+        Returns:
+            None
+
+        Raises:
+            NotSupportedError: Saving the network scenario state is only supported on Docker.
+        """
+        raise NotSupportedError("Saving the network scenario state is only supported on Docker.")
+
+    def restore_lab(self, archive_path: str, lab_hash: Optional[str] = None) -> Lab:
+        """Restore a network scenario previously saved with `save_lab` and redeploy it.
+
+        Args:
+            archive_path (str): The path of the archive file created by `save_lab`.
+            lab_hash (Optional[str]): If specified, override the hash of the restored network scenario.
+
+        Returns:
+            Kathara.model.Lab: The restored (and redeployed) network scenario.
+
+        Raises:
+            NotSupportedError: Restoring the network scenario state is only supported on Docker.
+        """
+        raise NotSupportedError("Restoring the network scenario state is only supported on Docker.")
+
     def wipe(self, all_users: bool = False) -> None:
         """Undeploy all the running network scenarios.
 

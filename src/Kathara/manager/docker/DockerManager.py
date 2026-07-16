@@ -1,5 +1,9 @@
 import io
+import json
 import logging
+import os
+import re
+import tarfile
 from typing import Set, Dict, Generator, Tuple, List, Optional, Union
 
 import docker
@@ -22,6 +26,7 @@ from ...exceptions import DockerDaemonConnectionError, LinkNotFoundError, Machin
 from ...exceptions import MachineNotFoundError
 from ...foundation.manager.IManager import IManager
 from ...model.Lab import Lab
+from ...model.LabSerializer import lab_to_dict, lab_from_dict
 from ...model.Link import Link
 from ...model.Machine import Machine
 from ...setting.Setting import Setting
@@ -344,6 +349,158 @@ class DockerManager(IManager):
         self.docker_machine.undeploy(lab_hash, selected_machines=selected_machines, excluded_machines=excluded_machines)
 
         self.docker_link.undeploy(lab_hash, selected_links=selected_links)
+
+    @privileged
+    def save_lab(self, archive_path: str, lab_hash: Optional[str] = None, lab_name: Optional[str] = None,
+                 lab: Optional[Lab] = None, selected_machines: Optional[Set[str]] = None,
+                 excluded_machines: Optional[Set[str]] = None) -> None:
+        """Save the state of a running network scenario into a single archive file.
+
+        Each running device is committed into a local Docker image (capturing its filesystem state),
+        and the committed images are bundled together with the network topology into the archive.
+        The scenario can later be recreated with `restore_lab`.
+
+        Args:
+            archive_path (str): The path of the archive file to create.
+            lab_hash (Optional[str]): The hash of the network scenario.
+                Can be used as an alternative to lab_name and lab. If None, lab_name or lab should be set.
+            lab_name (Optional[str]): The name of the network scenario.
+                Can be used as an alternative to lab_hash and lab. If None, lab_hash or lab should be set.
+            lab (Optional[Kathara.model.Lab]): The network scenario object.
+                Can be used as an alternative to lab_hash and lab_name. If None, lab_hash or lab_name should be set.
+            selected_machines (Optional[Set[str]]): If not None, save only the specified devices.
+            excluded_machines (Optional[Set[str]]): If not None, exclude devices from being saved.
+
+        Returns:
+            None
+
+        Raises:
+            InvocationError: If a running network scenario hash, name or object is not specified,
+                or if both `selected_machines` and `excluded_machines` are specified.
+            MachineNotFoundError: If there are no devices to save in the network scenario.
+        """
+        check_required_single_not_none_var(lab_hash=lab_hash, lab_name=lab_name, lab=lab)
+        if selected_machines and excluded_machines:
+            raise InvocationError("You can either select or exclude devices.")
+
+        # Refresh the topology (and device api_objects) from the running backend.
+        if lab is None:
+            lab = self.get_lab_from_api(lab_hash=lab_hash, lab_name=lab_name)
+        else:
+            self.update_lab_from_api(lab)
+
+        machine_names = set(lab.machines.keys())
+        if selected_machines:
+            machine_names &= selected_machines
+        if excluded_machines:
+            machine_names -= excluded_machines
+
+        if not machine_names:
+            raise MachineNotFoundError("There are no devices to save in the network scenario.")
+
+        # Docker repository names must be lowercase alphanumeric; sanitize the lab hash.
+        safe_hash = re.sub(r"[^a-z0-9]", "", lab.hash.lower())
+        committed_images: Dict[str, str] = {}
+        original_images: Dict[str, str] = {}
+
+        try:
+            for name in sorted(machine_names):
+                machine = lab.machines[name]
+                if machine.api_object is None:
+                    logging.warning(f"Device `{name}` is not running, its runtime state will not be saved.")
+                    continue
+
+                machine.api_object.reload()
+                original_images[name] = machine.get_image()
+                image_ref = self.docker_image.commit_container(
+                    machine.api_object, repository=f"kathara_save_{safe_hash}", tag=name
+                )
+                committed_images[name] = image_ref
+                # Point the device at its committed image, so restore redeploys it from the saved state.
+                machine.meta["image"] = image_ref
+
+            manifest = lab_to_dict(lab)
+            # Keep only the saved devices in the manifest and annotate their original images.
+            manifest["machines"] = [
+                {**machine_dict, "original_image": original_images.get(machine_dict["name"])}
+                for machine_dict in manifest["machines"] if machine_dict["name"] in machine_names
+            ]
+            # Keep only the collision domains referenced by the saved devices.
+            saved_links = {
+                iface["link"] for machine_dict in manifest["machines"] for iface in machine_dict["interfaces"]
+            }
+            manifest["links"] = [link for link in manifest["links"] if link["name"] in saved_links]
+
+            self._write_save_archive(archive_path, lab, manifest, committed_images)
+        finally:
+            # The archive is now the source of truth; drop the intermediate committed images.
+            for image_ref in committed_images.values():
+                self.docker_image.remove_image(image_ref)
+
+    @privileged
+    def restore_lab(self, archive_path: str, lab_hash: Optional[str] = None) -> Lab:
+        """Restore a network scenario previously saved with `save_lab` and redeploy it.
+
+        The committed images bundled in the archive are loaded into the local Docker repository, the
+        topology is rebuilt from the manifest, and the scenario is deployed from the saved images.
+
+        Args:
+            archive_path (str): The path of the archive file created by `save_lab`.
+            lab_hash (Optional[str]): If specified, override the hash of the restored network scenario.
+
+        Returns:
+            Kathara.model.Lab: The restored (and redeployed) network scenario.
+
+        Raises:
+            InvocationError: If the archive is not a valid Kathara save file.
+        """
+        with tarfile.open(archive_path, "r") as tar:
+            manifest_member = tar.extractfile("manifest.json") if "manifest.json" in tar.getnames() else None
+            if manifest_member is None:
+                raise InvocationError(f"Invalid Kathara save file `{archive_path}`: missing `manifest.json`.")
+            manifest = json.loads(manifest_member.read().decode("utf-8"))
+
+            # Load the committed device images into the local Docker repository.
+            for member in tar.getmembers():
+                if member.isfile() and member.name.startswith("images/"):
+                    self.docker_image.load_images_from_tar(tar.extractfile(member).read())
+
+            lab = lab_from_dict(manifest)
+            if lab_hash:
+                lab.hash = lab_hash
+
+            # Restore the network scenario files (startup/shutdown/shared/device dirs) into the lab filesystem.
+            for member in tar.getmembers():
+                if member.isfile() and member.name.startswith("lab/"):
+                    dst_path = member.name[len("lab"):]  # keep the leading slash for the fs
+                    parent = os.path.dirname(dst_path)
+                    if parent and parent != "/":
+                        lab.fs.makedirs(parent, recreate=True)
+                    lab.fs.writebytes(dst_path, tar.extractfile(member).read())
+
+        self.deploy_lab(lab)
+
+        return lab
+
+    def _write_save_archive(self, archive_path: str, lab: Lab, manifest: Dict,
+                            committed_images: Dict[str, str]) -> None:
+        """Write the save archive: manifest.json, committed device images, and lab filesystem files."""
+        with tarfile.open(archive_path, "w") as tar:
+            self._add_bytes_to_tar(tar, "manifest.json", json.dumps(manifest, indent=2).encode("utf-8"))
+
+            for name, image_ref in committed_images.items():
+                image_bytes = b"".join(self.docker_image.save_image_to_tar(image_ref))
+                self._add_bytes_to_tar(tar, f"images/{name}.tar", image_bytes)
+
+            for path in lab.fs.walk.files():
+                self._add_bytes_to_tar(tar, f"lab{path}", lab.fs.readbytes(path))
+
+    @staticmethod
+    def _add_bytes_to_tar(tar: tarfile.TarFile, name: str, data: bytes) -> None:
+        """Add an in-memory bytes payload as a file entry inside an open tar archive."""
+        tar_info = tarfile.TarInfo(name=name)
+        tar_info.size = len(data)
+        tar.addfile(tar_info, io.BytesIO(data))
 
     @privileged
     def wipe(self, all_users: bool = False) -> None:

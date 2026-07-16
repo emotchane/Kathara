@@ -1,9 +1,10 @@
 import logging
-from typing import Union, List, Set
+from typing import Union, List, Set, Iterator
 
+import docker.models.containers
 import docker.models.images
 from docker import DockerClient
-from docker.errors import APIError
+from docker.errors import APIError, ImageNotFound
 
 from ... import utils
 from ...event.EventDispatcher import EventDispatcher
@@ -61,6 +62,65 @@ class DockerImage(object):
         for progress in response:
             EventDispatcher.get_instance().dispatch("docker_pull_progress", progress=progress)
         EventDispatcher.get_instance().dispatch("docker_pull_ended")
+
+    def commit_container(self, container: docker.models.containers.Container, repository: str,
+                         tag: str = "latest") -> str:
+        """Commit a running container into a new local Docker image, capturing its filesystem state.
+
+        Args:
+            container (docker.models.containers.Container): The container to commit.
+            repository (str): The repository name to assign to the committed image.
+            tag (str): The tag to assign to the committed image. Default is "latest".
+
+        Returns:
+            str: The reference (`repository:tag`) of the committed image.
+        """
+        image_ref = f"{repository}:{tag}"
+        logging.debug(f"Committing container `{container.name}` into image `{image_ref}`...")
+
+        # Drop a stale image with the same reference from a previous save, if any.
+        self.remove_image(image_ref)
+        container.commit(repository=repository, tag=tag)
+
+        return image_ref
+
+    def save_image_to_tar(self, image_name: str) -> Iterator[bytes]:
+        """Export a local Docker image as a tar stream (equivalent to `docker image save`).
+
+        Args:
+            image_name (str): The name of the local Docker image to export.
+
+        Returns:
+            Iterator[bytes]: A generator streaming the image tarball content.
+        """
+        logging.debug(f"Saving image `{image_name}` to tar...")
+        return self.client.images.get(image_name).save(named=True)
+
+    def load_images_from_tar(self, tar_stream: Union[bytes, Iterator[bytes]]) -> None:
+        """Load one or more Docker images from a tar stream (equivalent to `docker image load`).
+
+        Args:
+            tar_stream (Union[bytes, Iterator[bytes]]): The image tarball content.
+
+        Returns:
+            None
+        """
+        logging.debug("Loading images from tar...")
+        self.client.images.load(tar_stream)
+
+    def remove_image(self, image_name: str) -> None:
+        """Remove a local Docker image, ignoring the error if it does not exist.
+
+        Args:
+            image_name (str): The name of the local Docker image to remove.
+
+        Returns:
+            None
+        """
+        try:
+            self.client.images.remove(image_name, force=True)
+        except ImageNotFound:
+            logging.debug(f"Image `{image_name}` not found, skipping removal.")
 
     def check_for_updates(self, image_name: str) -> None:
         """Update the specified image.

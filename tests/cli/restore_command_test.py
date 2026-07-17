@@ -25,6 +25,18 @@ def test_run_absolute_path(mock_docker_manager, mock_manager_get_instance):
     mock_docker_manager.restore_lab.assert_called_once_with(os.path.join('/saves', 'my.tar'))
 
 
+@mock.patch("src.Kathara.setting.Setting.Setting.get_instance")
+@mock.patch("src.Kathara.manager.Kathara.Kathara.get_instance")
+@mock.patch("src.Kathara.manager.docker.DockerManager.DockerManager")
+def test_run_noterminals(mock_docker_manager, mock_manager_get_instance, mock_setting_get_instance):
+    mock_manager_get_instance.return_value = mock_docker_manager
+    mock_setting = mock_setting_get_instance.return_value
+    command = RestoreCommand()
+    command.run('.', ['--noterminals', 'my.tar'])
+    assert mock_setting.open_terminals is False
+    mock_docker_manager.restore_lab.assert_called_once_with(os.path.join(os.getcwd(), 'my.tar'))
+
+
 @mock.patch("src.Kathara.cli.command.RestoreCommand.create_lab_table")
 @mock.patch("src.Kathara.manager.Kathara.Kathara.get_instance")
 @mock.patch("src.Kathara.manager.docker.DockerManager.DockerManager")

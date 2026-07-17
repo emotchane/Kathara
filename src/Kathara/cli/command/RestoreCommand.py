@@ -6,6 +6,7 @@ from ..ui.utils import create_panel
 from ... import utils
 from ...foundation.cli.command.Command import Command
 from ...manager.Kathara import Kathara
+from ...setting.Setting import Setting
 from ...strings import strings, wiki_description
 
 
@@ -27,6 +28,22 @@ class RestoreCommand(Command):
             help='Show a help message and exit.'
         )
 
+        group = self.parser.add_mutually_exclusive_group(required=False)
+        group.add_argument(
+            "--noterminals",
+            action="store_const",
+            dest="terminals",
+            const=False,
+            default=None,
+            help='Restore the network scenario without opening terminal windows.'
+        )
+        group.add_argument(
+            "--terminals",
+            action="store_const",
+            dest="terminals",
+            const=True,
+            help='Restore the network scenario opening terminal windows.'
+        )
         self.parser.add_argument(
             '-l', '--list',
             required=False,
@@ -45,6 +62,9 @@ class RestoreCommand(Command):
 
         archive_path = args['archive'].replace('"', '').replace("'", '')
         archive_path = utils.get_absolute_path(archive_path)
+
+        Setting.get_instance().open_terminals = args['terminals'] if args['terminals'] is not None \
+            else Setting.get_instance().open_terminals
 
         self.console.print(create_panel("Restoring Network Scenario", style="blue bold", justify="center"))
 

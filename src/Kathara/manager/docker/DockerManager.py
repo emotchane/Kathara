@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import tarfile
+import tempfile
 from typing import Set, Dict, Generator, Tuple, List, Optional, Union
 
 import docker
@@ -461,9 +462,11 @@ class DockerManager(IManager):
             manifest = json.loads(manifest_member.read().decode("utf-8"))
 
             # Load the committed device images into the local Docker repository.
+            # The extracted member is passed as a stream so large images are not read fully into memory.
             for member in tar.getmembers():
                 if member.isfile() and member.name.startswith("images/"):
-                    self.docker_image.load_images_from_tar(tar.extractfile(member).read())
+                    logging.info(f"Loading saved image `{member.name}`... This may take a while.")
+                    self.docker_image.load_images_from_tar(tar.extractfile(member))
 
             lab = lab_from_dict(manifest)
             if lab_hash:
@@ -476,7 +479,8 @@ class DockerManager(IManager):
                     parent = os.path.dirname(dst_path)
                     if parent and parent != "/":
                         lab.fs.makedirs(parent, recreate=True)
-                    lab.fs.writebytes(dst_path, tar.extractfile(member).read())
+                    with tar.extractfile(member) as src:
+                        lab.fs.upload(dst_path, src)
 
         self.deploy_lab(lab)
 
@@ -484,15 +488,31 @@ class DockerManager(IManager):
 
     def _write_save_archive(self, archive_path: str, lab: Lab, manifest: Dict,
                             committed_images: Dict[str, str]) -> None:
-        """Write the save archive: manifest.json, committed device images, and lab filesystem files."""
+        """Write the save archive: manifest.json, committed device images, and lab filesystem files.
+
+        Device images are streamed to disk (via a temporary file) before being added to the archive,
+        so that large images are never fully loaded into memory.
+        """
+        archive_abspath = os.path.abspath(archive_path)
+
         with tarfile.open(archive_path, "w") as tar:
             self._add_bytes_to_tar(tar, "manifest.json", json.dumps(manifest, indent=2).encode("utf-8"))
 
             for name, image_ref in committed_images.items():
-                image_bytes = b"".join(self.docker_image.save_image_to_tar(image_ref))
-                self._add_bytes_to_tar(tar, f"images/{name}.tar", image_bytes)
+                logging.info(f"Exporting saved image of device `{name}`... This may take a while.")
+                tmp_fd, tmp_path = tempfile.mkstemp(prefix="kathara_save_", suffix=".tar")
+                try:
+                    with os.fdopen(tmp_fd, "wb") as tmp_file:
+                        for chunk in self.docker_image.save_image_to_tar(image_ref):
+                            tmp_file.write(chunk)
+                    tar.add(tmp_path, arcname=f"images/{name}.tar")
+                finally:
+                    os.remove(tmp_path)
 
             for path in lab.fs.walk.files():
+                # Skip the output archive itself, in case it is being written inside the lab directory.
+                if lab.fs.hassyspath(path) and os.path.abspath(lab.fs.getsyspath(path)) == archive_abspath:
+                    continue
                 self._add_bytes_to_tar(tar, f"lab{path}", lab.fs.readbytes(path))
 
     @staticmethod

@@ -182,12 +182,14 @@ class Kathara(IManager):
 
     def save_lab(self, archive_path: str, lab_hash: Optional[str] = None, lab_name: Optional[str] = None,
                  lab: Optional[Lab] = None, selected_machines: Optional[Set[str]] = None,
-                 excluded_machines: Optional[Set[str]] = None) -> None:
+                 excluded_machines: Optional[Set[str]] = None, filesystem_diff: bool = True) -> None:
         """Save the state of a running network scenario into a single archive file.
 
-        Each running device is committed into an image (capturing its filesystem state), and the
-        committed images are bundled together with the network topology into the archive. The
-        scenario can later be recreated with `restore_lab`.
+        In the default `filesystem_diff` mode, only the filesystem changes of each device relative to
+        its base image are saved (smaller archive, but the base image must be available on restore).
+        When `filesystem_diff` is False, each running device is committed into a full image and the
+        whole images are bundled (larger archive, but self-contained). The scenario can later be
+        recreated with `restore_lab`.
 
         Args:
             archive_path (str): The path of the archive file to create.
@@ -199,6 +201,8 @@ class Kathara(IManager):
                 Can be used as an alternative to lab_hash and lab_name. If None, lab_hash or lab_name should be set.
             selected_machines (Optional[Set[str]]): If not None, save only the specified devices.
             excluded_machines (Optional[Set[str]]): If not None, exclude devices from being saved.
+            filesystem_diff (bool): If True (default), save only the filesystem diff of each device
+                relative to its base image. If False, save the full committed device images.
 
         Returns:
             None
@@ -208,7 +212,9 @@ class Kathara(IManager):
                 or if both `selected_machines` and `excluded_machines` are specified.
             NotSupportedError: If the current manager does not support saving the network scenario state.
         """
-        self.manager.save_lab(archive_path, lab_hash, lab_name, lab, selected_machines, excluded_machines)
+        self.manager.save_lab(
+            archive_path, lab_hash, lab_name, lab, selected_machines, excluded_machines, filesystem_diff
+        )
 
     def restore_lab(self, archive_path: str, lab_hash: Optional[str] = None) -> Lab:
         """Restore a network scenario previously saved with `save_lab` and redeploy it.

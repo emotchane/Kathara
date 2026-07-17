@@ -355,7 +355,7 @@ class KubernetesManager(IManager):
 
     def save_lab(self, archive_path: str, lab_hash: Optional[str] = None, lab_name: Optional[str] = None,
                  lab: Optional[Lab] = None, selected_machines: Optional[Set[str]] = None,
-                 excluded_machines: Optional[Set[str]] = None) -> None:
+                 excluded_machines: Optional[Set[str]] = None, filesystem_diff: bool = True) -> None:
         """Save the state of a running network scenario into a single archive file.
 
         Args:
@@ -365,6 +365,8 @@ class KubernetesManager(IManager):
             lab (Optional[Kathara.model.Lab]): The network scenario object.
             selected_machines (Optional[Set[str]]): If not None, save only the specified devices.
             excluded_machines (Optional[Set[str]]): If not None, exclude devices from being saved.
+            filesystem_diff (bool): If True (default), save only the filesystem diff of each device
+                relative to its base image. If False, save the full committed device images.
 
         Returns:
             None

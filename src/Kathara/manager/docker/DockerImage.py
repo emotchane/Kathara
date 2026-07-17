@@ -1,4 +1,8 @@
+import io
 import logging
+import os
+import tarfile
+import tempfile
 from typing import Union, List, Set, Iterator
 
 import docker.models.containers
@@ -107,6 +111,49 @@ class DockerImage(object):
         """
         logging.debug("Loading images from tar...")
         self.client.images.load(tar_stream)
+
+    def build_image_from_diff(self, base_image: str, tag: str, diff_tar_path: str,
+                              deletions: List[str]) -> docker.models.images.Image:
+        """Reconstruct an image from a base image plus a filesystem-diff tarball.
+
+        Builds an image equivalent to `base_image` with the saved changes applied: the diff tarball
+        (added/modified files) is extracted on top, and the recorded deletions are removed.
+
+        Args:
+            base_image (str): The base image to build upon.
+            tag (str): The tag to assign to the reconstructed image.
+            diff_tar_path (str): Path to the filesystem-diff tarball (added/modified files).
+            deletions (List[str]): Absolute paths removed relative to the base image.
+
+        Returns:
+            docker.models.images.Image: The reconstructed image.
+        """
+        dockerfile_lines = [f"FROM {base_image}", "ADD diff.tar /"]
+        if deletions:
+            # Single-quote each path for the shell, escaping embedded single quotes.
+            quoted = " ".join("'%s'" % p.replace("'", "'\\''") for p in deletions)
+            dockerfile_lines.append(f"RUN rm -rf {quoted}")
+        dockerfile = ("\n".join(dockerfile_lines) + "\n").encode("utf-8")
+
+        logging.debug(f"Reconstructing image `{tag}` from base `{base_image}`...")
+
+        # Assemble the build context (Dockerfile + diff.tar) on disk to avoid loading it into memory.
+        ctx_fd, ctx_path = tempfile.mkstemp(prefix="kathara_ctx_", suffix=".tar")
+        try:
+            with os.fdopen(ctx_fd, "wb") as ctx_file:
+                with tarfile.open(fileobj=ctx_file, mode="w") as ctx_tar:
+                    info = tarfile.TarInfo("Dockerfile")
+                    info.size = len(dockerfile)
+                    ctx_tar.addfile(info, io.BytesIO(dockerfile))
+                    ctx_tar.add(diff_tar_path, arcname="diff.tar")
+
+            with open(ctx_path, "rb") as ctx_file:
+                image, _ = self.client.images.build(
+                    fileobj=ctx_file, custom_context=True, tag=tag, rm=True, forcerm=True, pull=False
+                )
+            return image
+        finally:
+            os.remove(ctx_path)
 
     def remove_image(self, image_name: str) -> None:
         """Remove a local Docker image, ignoring the error if it does not exist.

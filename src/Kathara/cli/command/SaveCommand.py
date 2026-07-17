@@ -45,6 +45,23 @@ class SaveCommand(Command):
             required=False,
             help='Path of the save file to create (default: `<name>.tar` in the current directory).'
         )
+        mode_group = self.parser.add_mutually_exclusive_group(required=False)
+        mode_group.add_argument(
+            '--diff',
+            dest='filesystem_diff',
+            action='store_const',
+            const=True,
+            default=True,
+            help='Save only the filesystem changes of each device relative to its base image (default). '
+                 'Produces a smaller file, but the base images must be available on restore.'
+        )
+        mode_group.add_argument(
+            '--full-images',
+            dest='filesystem_diff',
+            action='store_const',
+            const=False,
+            help='Save the full committed image of each device. Produces a larger but self-contained file.'
+        )
         self.parser.add_argument(
             '--exclude',
             dest='excluded_machines',
@@ -91,7 +108,8 @@ class SaveCommand(Command):
         archive_path = utils.get_absolute_path(archive_path)
 
         Kathara.get_instance().save_lab(
-            archive_path, selected_machines=selected_machines, excluded_machines=excluded_machines, **target_kwargs
+            archive_path, selected_machines=selected_machines, excluded_machines=excluded_machines,
+            filesystem_diff=args['filesystem_diff'], **target_kwargs
         )
 
         self.console.print(f"[green]✓ Network scenario saved to [bold]{archive_path}[/bold].")

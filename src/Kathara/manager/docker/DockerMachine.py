@@ -361,10 +361,18 @@ class DockerMachine(object):
             if args:
                 args = shlex.split(args) if type(args) == str else args
 
+            # Docker's default AppArmor profile (`docker-default`, enforced on a stock Debian or
+            # Ubuntu host) denies `mount` and every write under /proc/sys but /proc/sys/kernel/shm*:
+            # a device could neither remount /proc/sys read-write nor change a `net.*` sysctl,
+            # which is what a network emulation is for.  Privileged devices are unconfined by Docker
+            # itself; the option is accepted and ignored on a host without AppArmor.
+            security_opt = ["apparmor=unconfined"] if not privileged else None
+
             machine_container = self.client.containers.create(image=image,
                                                               name=container_name,
                                                               hostname=machine.name,
                                                               cap_add=MACHINE_CAPABILITIES if not privileged else None,
+                                                              security_opt=security_opt,
                                                               privileged=privileged,
                                                               network=first_network.name if first_network else None,
                                                               network_mode="bridge" if first_network else "none",

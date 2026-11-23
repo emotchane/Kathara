@@ -1,9 +1,10 @@
+import base64
 import io
+import json
 import logging
-import os
 import tarfile
-import tempfile
-from typing import Union, List, Set, Iterator
+import zlib
+from typing import Union, List, Set, Iterator, Optional, Tuple
 
 import docker.models.containers
 import docker.models.images
@@ -12,7 +13,43 @@ from docker.errors import APIError, ImageNotFound
 
 from ... import utils
 from ...event.EventDispatcher import EventDispatcher
-from ...exceptions import InvalidImageArchitectureError, DockerImageNotFoundError
+from ...exceptions import InvalidImageArchitectureError, DockerImageNotFoundError, SaveLabError
+
+# Labels of the image `build_image_without` builds for a restored device: the image the device
+# really runs on, and the paths deleted from it (`encode_deletions`).
+SAVE_BASE_LABEL = "kathara.save.base"
+SAVE_DELETIONS_LABEL = "kathara.save.deletions"
+# The labels travel in the query string of the build request: a longer encoded list is not kept,
+# and the device cannot be saved again (`decode_deletions`).
+MAX_DELETIONS_LABEL = 512 * 1024
+DELETIONS_OVERFLOW = "!"
+# The list of the deletions in the build context, then in the image while they are applied.
+DELETIONS_FILE = ".kathara_deletions"
+
+
+def encode_deletions(paths: List[str]) -> str:
+    """Encode a list of deleted paths as the value of `SAVE_DELETIONS_LABEL`."""
+    data = json.dumps(sorted(set(paths)), separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(zlib.compress(data, 9)).decode("ascii")
+
+
+def decode_deletions(value: str) -> List[str]:
+    """Decode the value of `SAVE_DELETIONS_LABEL`.
+
+    Raises:
+        SaveLabError: If the list was too long to be kept, or cannot be read.
+    """
+    if not value:
+        return []
+    if value == DELETIONS_OVERFLOW:
+        raise SaveLabError("too many files were deleted in a device before its last save: it cannot be saved again.")
+    try:
+        paths = json.loads(zlib.decompress(base64.b64decode(value, validate=True)).decode("utf-8"))
+    except (ValueError, zlib.error) as e:
+        raise SaveLabError(f"unreadable list of deleted files ({e}).")
+    if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+        raise SaveLabError("unreadable list of deleted files.")
+    return paths
 
 
 class DockerImage(object):
@@ -112,48 +149,104 @@ class DockerImage(object):
         logging.debug("Loading images from tar...")
         self.client.images.load(tar_stream)
 
-    def build_image_from_diff(self, base_image: str, tag: str, diff_tar_path: str,
-                              deletions: List[str]) -> docker.models.images.Image:
-        """Reconstruct an image from a base image plus a filesystem-diff tarball.
+    def build_image_without(self, base_image: str, tag: str, deletions: List[str]) -> docker.models.images.Image:
+        """Build the image of a restored device that had deleted files of its image.
 
-        Builds an image equivalent to `base_image` with the saved changes applied: the diff tarball
-        (added/modified files) is extracted on top, and the recorded deletions are removed.
+        The image is `base_image` without the paths of `deletions`: the files a device added or
+        changed are copied into its container when it is created (they stay in its writable layer,
+        so its next filesystem diff is still relative to `base_image`), but a deletion cannot be
+        copied.  The labels of the image tell `saved_state_of` what the device really runs on.
 
         Args:
-            base_image (str): The base image to build upon.
-            tag (str): The tag to assign to the reconstructed image.
-            diff_tar_path (str): Path to the filesystem-diff tarball (added/modified files).
-            deletions (List[str]): Absolute paths removed relative to the base image.
+            base_image (str): The image of the device.
+            tag (str): The tag to assign to the built image.
+            deletions (List[str]): Absolute paths removed relative to `base_image`.
 
         Returns:
-            docker.models.images.Image: The reconstructed image.
+            docker.models.images.Image: The built image.
         """
-        dockerfile_lines = [f"FROM {base_image}", "ADD diff.tar /"]
-        if deletions:
-            # Single-quote each path for the shell, escaping embedded single quotes.
-            quoted = " ".join("'%s'" % p.replace("'", "'\\''") for p in deletions)
-            dockerfile_lines.append(f"RUN rm -rf {quoted}")
-        dockerfile = ("\n".join(dockerfile_lines) + "\n").encode("utf-8")
+        listed = [path for path in deletions if "\n" not in path]
+        if len(listed) != len(deletions):
+            logging.warning(f"Image `{tag}`: {len(deletions) - len(listed)} deleted path(s) with a newline "
+                            f"in their name cannot be removed, they are left in place.")
+        # One path per line, read by the shell: no length limit, unlike a Dockerfile line.
+        deletions_list = "".join(f"{path}\n" for path in listed).encode("utf-8")
+        dockerfile = (
+            f"FROM {base_image}\n"
+            f"COPY {DELETIONS_FILE} /{DELETIONS_FILE}\n"
+            f'RUN while IFS= read -r p; do rm -rf -- "$p"; done < /{DELETIONS_FILE}; rm -f /{DELETIONS_FILE}\n'
+        ).encode("utf-8")
+        encoded = encode_deletions(listed)
+        labels = {
+            SAVE_BASE_LABEL: base_image,
+            SAVE_DELETIONS_LABEL: encoded if len(encoded) <= MAX_DELETIONS_LABEL else DELETIONS_OVERFLOW,
+        }
 
-        logging.debug(f"Reconstructing image `{tag}` from base `{base_image}`...")
+        logging.debug(f"Building image `{tag}`: `{base_image}` without {len(listed)} deleted path(s)...")
 
-        # Assemble the build context (Dockerfile + diff.tar) on disk to avoid loading it into memory.
-        ctx_fd, ctx_path = tempfile.mkstemp(prefix="kathara_ctx_", suffix=".tar")
+        context = io.BytesIO()
+        with tarfile.open(fileobj=context, mode="w") as ctx_tar:
+            for name, data in (("Dockerfile", dockerfile), (DELETIONS_FILE, deletions_list)):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                ctx_tar.addfile(info, io.BytesIO(data))
+        context.seek(0)
+
+        image, _ = self.client.images.build(
+            fileobj=context, custom_context=True, tag=tag, rm=True, forcerm=True, pull=False, labels=labels
+        )
+        return image
+
+    @staticmethod
+    def saved_state_of(image: docker.models.images.Image) -> Tuple[Optional[str], List[str]]:
+        """Tell what a device runs on when its image was built by `build_image_without`.
+
+        Args:
+            image (docker.models.images.Image): The image of the container of a device.
+
+        Returns:
+            Tuple[Optional[str], List[str]]: The image the device really runs on and the paths
+                deleted from it; (None, []) for any other image.
+
+        Raises:
+            SaveLabError: If the image was built without the list of its deletions (too many).
+        """
+        labels = getattr(image, "labels", None)
+        if not isinstance(labels, dict) or not labels.get(SAVE_BASE_LABEL):
+            return None, []
+
+        return labels[SAVE_BASE_LABEL], decode_deletions(labels.get(SAVE_DELETIONS_LABEL, ""))
+
+    def remove_saved_images(self, repository: str, selected: Optional[Set[str]] = None,
+                            excluded: Optional[Set[str]] = None) -> None:
+        """Remove the images `build_image_without` built for the devices of a network scenario.
+
+        An image still used by a container is left in place.
+
+        Args:
+            repository (str): The repository of the images (one tag per device).
+            selected (Optional[Set[str]]): If not None, remove only the images of these devices.
+            excluded (Optional[Set[str]]): If not None, keep the images of these devices.
+
+        Returns:
+            None
+        """
         try:
-            with os.fdopen(ctx_fd, "wb") as ctx_file:
-                with tarfile.open(fileobj=ctx_file, mode="w") as ctx_tar:
-                    info = tarfile.TarInfo("Dockerfile")
-                    info.size = len(dockerfile)
-                    ctx_tar.addfile(info, io.BytesIO(dockerfile))
-                    ctx_tar.add(diff_tar_path, arcname="diff.tar")
+            images = self.client.images.list(name=repository)
+        except APIError as e:
+            logging.debug(f"Cannot list the images of `{repository}`: {e}")
+            return
 
-            with open(ctx_path, "rb") as ctx_file:
-                image, _ = self.client.images.build(
-                    fileobj=ctx_file, custom_context=True, tag=tag, rm=True, forcerm=True, pull=False
-                )
-            return image
-        finally:
-            os.remove(ctx_path)
+        for image in images:
+            for reference in image.tags:
+                name, _, device = reference.rpartition(":")
+                if name != repository or (selected is not None and device not in selected) \
+                        or (excluded is not None and device in excluded):
+                    continue
+                try:
+                    self.client.images.remove(reference)
+                except APIError as e:
+                    logging.debug(f"Image `{reference}` not removed: {e}")
 
     def remove_image(self, image_name: str) -> None:
         """Remove a local Docker image, ignoring the error if it does not exist.

@@ -10,9 +10,12 @@ import pytest
 
 sys.path.insert(0, './')
 
+from src.Kathara.manager.docker.DockerImage import DockerImage, SAVE_BASE_LABEL, SAVE_DELETIONS_LABEL, \
+    DELETIONS_OVERFLOW, DELETIONS_FILE, MAX_DELETIONS_LABEL, encode_deletions, decode_deletions
+from src.Kathara.manager.docker.DockerMachine import RESTORE_DIFF_META
 from src.Kathara.manager.docker.DockerManager import DockerManager
 from src.Kathara.model.Lab import Lab
-from src.Kathara.exceptions import InvocationError, MachineNotFoundError
+from src.Kathara.exceptions import InvocationError, MachineNotFoundError, SaveLabError
 
 
 @pytest.fixture()
@@ -155,6 +158,58 @@ def test_save_lab_diff_writes_archive(docker_manager, running_lab, tmp_path):
         assert "etc/hosts" not in diff_names          # excluded path not captured
 
 
+def test_save_lab_diff_of_a_restored_device_is_relative_to_its_real_image(docker_manager, running_lab, tmp_path):
+    """A device restored from a save that had deleted files runs an image built by restore_lab:
+    the next save names the image of the device itself and carries the deletions over."""
+    docker_manager.update_lab_from_api = Mock()
+    _configure_diff(running_lab)
+    running_lab.get_machine("pc1").add_meta("image", "kathara_save_h:pc1")
+    running_lab.get_machine("pc1").api_object.image.labels = {
+        SAVE_BASE_LABEL: "kathara/real", SAVE_DELETIONS_LABEL: encode_deletions(["/gone/before", "/oldfile"]),
+    }
+
+    archive = str(tmp_path / "scenario.tar")
+    docker_manager.save_lab(archive, lab=running_lab)
+
+    with tarfile.open(archive, "r") as tar:
+        manifest = json.loads(tar.extractfile("manifest.json").read().decode())
+    pc1 = next(m for m in manifest["machines"] if m["name"] == "pc1")
+    pc2 = next(m for m in manifest["machines"] if m["name"] == "pc2")
+    assert pc1["original_image"] == "kathara/real"
+    assert pc1["deletions"] == ["/gone/before", "/oldfile"]
+    assert pc2["original_image"] == "kathara/test2"
+    assert pc2["deletions"] == ["/oldfile"]
+
+
+def test_save_lab_diff_refuses_a_device_whose_deletions_were_not_kept(docker_manager, running_lab, tmp_path):
+    docker_manager.update_lab_from_api = Mock()
+    _configure_diff(running_lab)
+    running_lab.get_machine("pc1").api_object.image.labels = {
+        SAVE_BASE_LABEL: "kathara/real", SAVE_DELETIONS_LABEL: DELETIONS_OVERFLOW,
+    }
+
+    with pytest.raises(SaveLabError):
+        docker_manager.save_lab(str(tmp_path / "scenario.tar"), lab=running_lab)
+
+
+def test_build_device_diff_spools_a_large_file(docker_manager):
+    container = Mock()
+    container.diff.return_value = [{"Path": "/root/big", "Kind": 1}]
+    content = os.urandom(docker_manager._DIFF_SPOOL_SIZE + 4096)
+    tar_bytes = _fake_get_archive("/root/big", content)[0][0]
+    # as the Docker API streams it: in chunks
+    chunks = [tar_bytes[i:i + 65536] for i in range(0, len(tar_bytes), 65536)]
+    container.get_archive.side_effect = lambda path: (iter(chunks), {})
+
+    diff_path, deletions = docker_manager._build_device_diff(container)
+    try:
+        assert deletions == []
+        with tarfile.open(diff_path) as tar:
+            assert tar.extractfile("root/big").read() == content
+    finally:
+        os.remove(diff_path)
+
+
 def test_build_device_diff_excludes_and_deletes(docker_manager):
     container = Mock()
     container.diff.return_value = [
@@ -247,34 +302,82 @@ def _make_diff_archive(path, manifest, diffs):
             add(f"images/{name}.diff.tar", data)
 
 
-def test_restore_lab_diff_builds_images_and_deploys(docker_manager, tmp_path):
-    manifest = {
+def _diff_manifest(deletions):
+    return {
         "save_format_version": 1, "save_mode": "diff",
-        "lab": {"name": "restored", "hash": "somehash", "general_options": {},
+        "lab": {"name": "restored", "hash": "Some-Hash", "general_options": {},
                 "global_machine_metadata": {}},
         "machines": [{"name": "pc1", "meta": {"image": "kathara_save_h:pc1"},
-                      "original_image": "kathara/test1", "deletions": ["/x"],
+                      "original_image": "kathara/test1", "deletions": deletions,
                       "interfaces": [{"number": 0, "link": "A", "mac_address": None}]}],
         "links": [{"name": "A"}],
     }
-    archive = str(tmp_path / "scenario.tar")
-    _make_diff_archive(archive, manifest, {"pc1": b"DIFFTAR"})
+
+
+def _restore(docker_manager, archive, **kwargs):
+    """restore_lab with the image and deploy layers mocked: the lab, and what the deployment saw
+    of each device (its image and the content of its saved diff)."""
+    seen = {}
+
+    def deploy(lab):
+        for name, machine in lab.machines.items():
+            diff_path = machine.meta.get(RESTORE_DIFF_META)
+            seen[name] = (machine.meta["image"], diff_path, open(diff_path, "rb").read() if diff_path else None)
 
     docker_manager.docker_image = Mock()
-    docker_manager.deploy_lab = Mock()
+    docker_manager.deploy_lab = Mock(side_effect=deploy)
+    return docker_manager.restore_lab(archive, **kwargs), seen
 
-    lab = docker_manager.restore_lab(archive)
+
+def test_restore_lab_diff_copies_the_saved_files_on_the_base_image(docker_manager, tmp_path):
+    archive = str(tmp_path / "scenario.tar")
+    _make_diff_archive(archive, _diff_manifest([]), {"pc1": b"DIFFTAR"})
+
+    lab, seen = _restore(docker_manager, archive)
 
     docker_manager.docker_image.check_from_list.assert_called_once_with({"kathara/test1"})
-    docker_manager.docker_image.build_image_from_diff.assert_called_once()
-    call_args = docker_manager.docker_image.build_image_from_diff.call_args[0]
-    assert call_args[0] == "kathara/test1"          # base image
-    assert call_args[1] == "kathara_save_h:pc1"     # target ref
-    assert call_args[3] == ["/x"]                   # deletions
-
+    docker_manager.docker_image.build_image_without.assert_not_called()
     docker_manager.deploy_lab.assert_called_once()
-    deployed = docker_manager.deploy_lab.call_args[0][0]
-    assert deployed.get_machine("pc1").meta["image"] == "kathara_save_h:pc1"
+    # the device runs its own image; its saved files are handed to its creation
+    image, diff_path, diff = seen["pc1"]
+    assert image == "kathara/test1"
+    assert diff == b"DIFFTAR"
+    # nothing of the restore is left once the scenario is deployed
+    assert not os.path.exists(diff_path)
+    assert RESTORE_DIFF_META not in lab.get_machine("pc1").meta
+
+
+def test_restore_lab_diff_builds_an_image_only_for_the_deletions(docker_manager, tmp_path):
+    archive = str(tmp_path / "scenario.tar")
+    _make_diff_archive(archive, _diff_manifest(["/x"]), {"pc1": b"DIFFTAR"})
+
+    lab, seen = _restore(docker_manager, archive)
+
+    # the base image without the deleted files, under the hash of the restored scenario
+    docker_manager.docker_image.build_image_without.assert_called_once_with(
+        "kathara/test1", "kathara_save_somehash:pc1", ["/x"])
+    assert seen["pc1"][0] == "kathara_save_somehash:pc1"
+    assert seen["pc1"][2] == b"DIFFTAR"
+    assert lab.get_machine("pc1").meta["image"] == "kathara_save_somehash:pc1"
+
+
+def test_restore_lab_diff_cleans_up_when_the_deployment_fails(docker_manager, tmp_path):
+    archive = str(tmp_path / "scenario.tar")
+    _make_diff_archive(archive, _diff_manifest([]), {"pc1": b"DIFFTAR"})
+    paths = []
+
+    def deploy(lab):
+        paths.append(lab.get_machine("pc1").meta[RESTORE_DIFF_META])
+        raise RuntimeError("boom")
+
+    docker_manager.docker_image = Mock()
+    docker_manager.deploy_lab = Mock(side_effect=deploy)
+    caller_lab = _caller_lab()
+    with pytest.raises(RuntimeError):
+        docker_manager.restore_lab(archive, lab=caller_lab)
+
+    assert paths and not os.path.exists(paths[0])
+    assert RESTORE_DIFF_META not in caller_lab.get_machine("pc1").meta
 
 
 #
@@ -315,9 +418,10 @@ def test_restore_lab_with_lab_uses_caller_topology_and_saved_images(docker_manag
     assert lab is caller_lab
     docker_manager.deploy_lab.assert_called_once()
     assert docker_manager.deploy_lab.call_args[0][0] is caller_lab
-    docker_manager.docker_image.build_image_from_diff.assert_called_once()
+    docker_manager.docker_image.build_image_without.assert_not_called()
 
-    assert caller_lab.get_machine("pc1").meta["image"] == "kathara_save_h:pc1"
+    # the image the device was saved on, not the one a previous restore had built
+    assert caller_lab.get_machine("pc1").meta["image"] == "kathara/base"
     assert caller_lab.get_machine("pc1").meta["envs"] == {"FOO": "bar"}
     assert caller_lab.get_machine("pc2").meta["image"] == "kathara/other"
     assert caller_lab.shared_path == "/tmp/shared"
@@ -354,3 +458,100 @@ def test_restore_lab_with_lab_uploads_lab_files_into_caller_fs(docker_manager, t
     assert lab is caller_lab
     assert caller_lab.fs.readbytes("/pc1.startup") == b"echo hi\n"
     docker_manager.docker_image.load_images_from_tar.assert_called_once()
+
+
+#
+# undeploy_lab: the images of a restore
+#
+@mock.patch("src.Kathara.manager.docker.DockerLink.DockerLink.undeploy")
+@mock.patch("src.Kathara.manager.docker.DockerMachine.DockerMachine.undeploy")
+def test_undeploy_lab_removes_the_images_of_a_restore(mock_undeploy_machine, mock_undeploy_link, docker_manager):
+    docker_manager.docker_image = Mock()
+
+    docker_manager.undeploy_lab(lab_hash="Some-Hash", selected_machines={"pc1"})
+
+    docker_manager.docker_image.remove_saved_images.assert_called_once_with(
+        "kathara_save_somehash", selected={"pc1"}, excluded=None)
+
+
+#
+# DockerImage: the image of a restored device that had deleted files
+#
+def test_deletions_label_round_trip():
+    paths = ["/etc/b", "/a b/c", "/é", "/etc/b"]
+    assert decode_deletions(encode_deletions(paths)) == sorted(set(paths))
+    assert decode_deletions("") == []
+    with pytest.raises(SaveLabError):
+        decode_deletions(DELETIONS_OVERFLOW)
+    with pytest.raises(SaveLabError):
+        decode_deletions("not a list")
+
+
+def test_build_image_without_removes_the_listed_paths():
+    client = Mock()
+    client.images.build.return_value = (Mock(), [])
+    deletions = ["/etc/one", "/a 'quoted' $path", "/bad\nname"]
+
+    DockerImage(client).build_image_without("kathara/base", "kathara_save_h:pc1", deletions)
+
+    kwargs = client.images.build.call_args[1]
+    assert kwargs["tag"] == "kathara_save_h:pc1" and kwargs["pull"] is False
+    assert kwargs["labels"][SAVE_BASE_LABEL] == "kathara/base"
+    # a path with a newline cannot be listed: left out of the image and of its label
+    assert decode_deletions(kwargs["labels"][SAVE_DELETIONS_LABEL]) == ["/a 'quoted' $path", "/etc/one"]
+    with tarfile.open(fileobj=kwargs["fileobj"]) as context:
+        dockerfile = context.extractfile("Dockerfile").read().decode()
+        listed = context.extractfile(DELETIONS_FILE).read().decode()
+    assert dockerfile.startswith("FROM kathara/base\n")
+    assert listed == "/etc/one\n/a 'quoted' $path\n"
+    # the paths never appear on a Dockerfile line (65535 bytes at most, and a shell to quote for)
+    assert "/etc/one" not in dockerfile
+
+
+def test_build_image_without_too_many_deletions_marks_the_image():
+    client = Mock()
+    client.images.build.return_value = (Mock(), [])
+    # paths that do not compress: the encoded list is longer than a label may be
+    deletions = ["/" + os.urandom(48).hex() for _ in range(MAX_DELETIONS_LABEL // 64)]
+
+    DockerImage(client).build_image_without("kathara/base", "kathara_save_h:pc1", deletions)
+
+    assert client.images.build.call_args[1]["labels"][SAVE_DELETIONS_LABEL] == DELETIONS_OVERFLOW
+
+
+def test_saved_state_of():
+    image = Mock()
+    image.labels = {SAVE_BASE_LABEL: "kathara/base", SAVE_DELETIONS_LABEL: encode_deletions(["/x"])}
+    assert DockerImage.saved_state_of(image) == ("kathara/base", ["/x"])
+    image.labels = {"other": "label"}
+    assert DockerImage.saved_state_of(image) == (None, [])
+    image.labels = None
+    assert DockerImage.saved_state_of(image) == (None, [])
+
+
+def test_remove_saved_images():
+    from docker.errors import APIError
+    client = Mock()
+    mine, other, used = Mock(), Mock(), Mock()
+    mine.tags = ["kathara_save_h:pc1", "kathara_save_h:pc2"]
+    other.tags = ["kathara_save_hh:pc1"]       # another scenario whose repository starts alike
+    used.tags = ["kathara_save_h:pc3"]
+    client.images.list.return_value = [mine, other, used]
+
+    def remove(reference):
+        if reference == "kathara_save_h:pc3":
+            raise APIError("conflict: a container is using the image")
+
+    client.images.remove.side_effect = remove
+
+    DockerImage(client).remove_saved_images("kathara_save_h")
+    assert [c[0][0] for c in client.images.remove.call_args_list] == \
+        ["kathara_save_h:pc1", "kathara_save_h:pc2", "kathara_save_h:pc3"]
+
+    client.images.remove.reset_mock()
+    DockerImage(client).remove_saved_images("kathara_save_h", selected={"pc2", "pc9"})
+    assert [c[0][0] for c in client.images.remove.call_args_list] == ["kathara_save_h:pc2"]
+
+    client.images.remove.reset_mock()
+    DockerImage(client).remove_saved_images("kathara_save_h", excluded={"pc2"})
+    assert [c[0][0] for c in client.images.remove.call_args_list] == ["kathara_save_h:pc1", "kathara_save_h:pc3"]

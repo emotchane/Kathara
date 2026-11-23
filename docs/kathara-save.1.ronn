@@ -12,7 +12,7 @@ Save the current state of a running network scenario into a single archive file,
 
 The filesystem state of each running device (e.g. packages installed and configuration files edited at runtime) is captured and bundled together with the network topology (devices, collision domains, interfaces and device configuration) into the output archive.
 
-By default (`--diff`), only the filesystem changes of each device relative to its base image are saved, producing a small archive. On restore, the base images must be available (they are pulled if necessary). With `--full-images`, the entire committed image of each device is saved instead, producing a larger but fully self-contained archive.
+By default (`--diff`), only the filesystem changes of each device relative to its base image are saved, producing a small archive. On restore, the base images must be available (they are pulled if necessary). The base image is always the image of the device itself, also when the scenario was restored from a previous save. With `--full-images`, the entire committed image of each device is saved instead, producing a larger but fully self-contained archive.
 
 By default, all the devices of the network scenario are saved. If a list of <DEVICE_NAME>s is provided, then only devices with a matching name are saved.
 

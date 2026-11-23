@@ -39,6 +39,10 @@ OCI_RUNTIME_RE = re.compile(
 
 IFACE_SYSCTL_RE = re.compile(r"net\.ipv[4,6]\.(conf|neigh)\.eth\d+")
 
+# Private meta of a device being restored (`DockerManager.restore_lab`): the path of the tarball of
+# its saved filesystem diff, copied into its container before it starts.
+RESTORE_DIFF_META = "_restore_diff"
+
 # Known commands that each container should execute
 # Run order: shared.startup, machine.startup and machine.meta['exec_commands']
 STARTUP_COMMANDS = [
@@ -398,6 +402,14 @@ class DockerMachine(object):
         tar_data = machine.pack_data()
         if tar_data:
             self.copy_files(machine_container, "/", tar_data)
+
+        # A restored device: its saved files on top, in the writable layer of the container, so that
+        # they are part of its next filesystem diff (an image holding them would hide them from it).
+        restore_diff = machine.meta.get(RESTORE_DIFF_META)
+        if restore_diff:
+            logging.debug(f"Copying the saved filesystem of device `{machine.name}`...")
+            with open(restore_diff, "rb") as diff_file:
+                machine_container.put_archive("/", diff_file)
 
         machine.api_object = machine_container
 

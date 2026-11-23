@@ -187,6 +187,11 @@ class DockerPluginError(Exception):
     pass
 
 
+class SaveLabError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"The network scenario cannot be saved: {message}")
+
+
 # Kubernetes Exceptions
 class KubernetesConfigMapError(Exception):
     pass

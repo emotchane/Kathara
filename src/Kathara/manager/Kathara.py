@@ -224,8 +224,10 @@ class Kathara(IManager):
                     lab: Optional[Lab] = None) -> Lab:
         """Restore a network scenario previously saved with `save_lab` and redeploy it.
 
-        The committed images bundled in the archive are loaded, the topology is rebuilt from the
-        manifest (or taken from `lab`), and the scenario is deployed from the saved images.
+        The topology is rebuilt from the manifest (or taken from `lab`) and the scenario is deployed
+        with the saved filesystems: from the committed images bundled in a full-image archive, or,
+        for a filesystem-diff archive, from the base image of each device with its saved files
+        copied into its container before it starts.
 
         Args:
             archive_path (str): The path of the archive file created by `save_lab`.

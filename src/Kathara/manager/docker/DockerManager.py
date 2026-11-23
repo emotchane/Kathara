@@ -16,7 +16,7 @@ from requests.exceptions import ConnectionError as RequestsConnectionError
 
 from .DockerImage import DockerImage
 from .DockerLink import DockerLink
-from .DockerMachine import DockerMachine
+from .DockerMachine import DockerMachine, RESTORE_DIFF_META
 from .DockerPlugin import DockerPlugin
 from .exec_stream.DockerExecStream import DockerExecStream
 from .stats.DockerLinkStats import DockerLinkStats
@@ -74,6 +74,8 @@ class DockerManager(IManager):
     _DIFF_EXCLUDED_PREFIXES: Tuple[str, ...] = (
         "/dev/", "/proc/", "/sys/", "/run/", "/tmp/", "/hosthome/", "/shared/", "/hostlab/",
     )
+    # A changed file of a device is read in memory up to this size, on disk beyond.
+    _DIFF_SPOOL_SIZE: int = 8 * 1024 * 1024
 
     @check_docker_status
     def __init__(self) -> None:
@@ -367,6 +369,19 @@ class DockerManager(IManager):
 
         self.docker_link.undeploy(lab_hash, selected_links=selected_links)
 
+        # The images `restore_lab` built for the devices of this scenario are of no use without them.
+        self.docker_image.remove_saved_images(
+            self._save_repository(lab_hash), selected=selected_machines, excluded=excluded_machines
+        )
+
+    @staticmethod
+    def _save_repository(lab_hash: str) -> str:
+        """Return the repository of the images built or committed for the devices of a network scenario.
+
+        Docker repository names must be lowercase alphanumeric: the hash is sanitized.
+        """
+        return "kathara_save_" + re.sub(r"[^a-z0-9]", "", lab_hash.lower())
+
     @privileged
     def save_lab(self, archive_path: str, lab_hash: Optional[str] = None, lab_name: Optional[str] = None,
                  lab: Optional[Lab] = None, selected_machines: Optional[Set[str]] = None,
@@ -375,6 +390,8 @@ class DockerManager(IManager):
 
         In the default `filesystem_diff` mode, only the filesystem changes of each device relative to
         its base image are saved (smaller archive, but the base image must be available on restore).
+        The base image is always the image of the device itself, also for a scenario that was restored
+        from a save: such an archive restores on a host that never saw the previous ones.
         When `filesystem_diff` is False, each running device is committed into a full local image and
         the whole images are bundled (larger archive, but fully self-contained). The scenario can later
         be recreated with `restore_lab`.
@@ -419,8 +436,7 @@ class DockerManager(IManager):
         if not machine_names:
             raise MachineNotFoundError("There are no devices to save in the network scenario.")
 
-        # Docker repository names must be lowercase alphanumeric; sanitize the lab hash.
-        safe_hash = re.sub(r"[^a-z0-9]", "", lab.hash.lower())
+        repository = self._save_repository(lab.hash)
         committed_images: Dict[str, str] = {}     # device -> full committed image ref (full mode)
         diff_files: Dict[str, str] = {}           # device -> temp diff tarball path (diff mode)
         original_images: Dict[str, str] = {}      # device -> base image
@@ -438,15 +454,22 @@ class DockerManager(IManager):
 
                 if filesystem_diff:
                     logging.info(f"Computing filesystem diff of device `{name}`...")
-                    diff_files[name], deletions[name] = self._build_device_diff(machine.api_object)
+                    # A restored device that had deleted files of its image runs an image built by
+                    # `restore_lab`: its labels name the image the diff is really relative to, and
+                    # the paths already deleted from it.
+                    base_image, already_deleted = self.docker_image.saved_state_of(machine.api_object.image)
+                    if base_image:
+                        original_images[name] = base_image
+                    diff_files[name], deleted = self._build_device_diff(machine.api_object)
+                    deletions[name] = sorted(set(already_deleted) | set(deleted))
                 else:
                     image_ref = self.docker_image.commit_container(
-                        machine.api_object, repository=f"kathara_save_{safe_hash}", tag=name
+                        machine.api_object, repository=repository, tag=name
                     )
                     committed_images[name] = image_ref
 
-                # Point the device at the image that restore will provide (committed or reconstructed).
-                machine.meta["image"] = f"kathara_save_{safe_hash}:{name}"
+                # Point the device at the image a full restore loads (a diff restore does not use it).
+                machine.meta["image"] = f"{repository}:{name}"
 
             manifest = lab_to_dict(lab)
             manifest["save_mode"] = "diff" if filesystem_diff else "full"
@@ -516,16 +539,21 @@ class DockerManager(IManager):
                         continue
 
                     parent = os.path.dirname(path).lstrip("/")
-                    with tarfile.open(fileobj=io.BytesIO(b"".join(bits))) as src_tar:
-                        for member in src_tar.getmembers():
-                            # Keep only the top-level entry (the path itself), not directory contents.
-                            if "/" in member.name:
-                                continue
-                            member.name = "/".join(filter(None, [parent, member.name]))
-                            if member.isfile():
-                                diff_tar.addfile(member, src_tar.extractfile(member))
-                            else:
-                                diff_tar.addfile(member)
+                    # Spooled to disk beyond a few megabytes: a device may hold a file larger than the memory.
+                    with tempfile.SpooledTemporaryFile(max_size=self._DIFF_SPOOL_SIZE) as spool:
+                        for chunk in bits:
+                            spool.write(chunk)
+                        spool.seek(0)
+                        with tarfile.open(fileobj=spool) as src_tar:
+                            for member in src_tar.getmembers():
+                                # Keep only the top-level entry (the path itself), not directory contents.
+                                if "/" in member.name:
+                                    continue
+                                member.name = "/".join(filter(None, [parent, member.name]))
+                                if member.isfile():
+                                    diff_tar.addfile(member, src_tar.extractfile(member))
+                                else:
+                                    diff_tar.addfile(member)
 
         return diff_path, deleted
 
@@ -540,17 +568,20 @@ class DockerManager(IManager):
         """Restore a network scenario previously saved with `save_lab` and redeploy it.
 
         For a full-image save, the bundled images are loaded into the local Docker repository. For a
-        filesystem-diff save, each device image is reconstructed from its base image plus the saved
-        diff. The topology is then rebuilt from the manifest (or taken from `lab`) and the scenario
-        is deployed.
+        filesystem-diff save, each device is created from its base image and the saved diff is copied
+        into its container before it starts: the saved files live in the writable layer of the
+        device, so a later filesystem-diff save is again relative to the base image. Only a device
+        that had deleted files of its base image gets an image of its own (the base image without
+        them), removed when the scenario is undeployed. The topology is rebuilt from the manifest
+        (or taken from `lab`) and the scenario is deployed.
 
         Args:
             archive_path (str): The path of the archive file created by `save_lab`.
             lab_hash (Optional[str]): If specified, override the hash of the restored network scenario.
             lab (Optional[Kathara.model.Lab]): If specified, deploy this network scenario instead of the
-                one rebuilt from the manifest: each of its devices that appears in the save file is pointed
-                at the restored image, every other device option and the topology come from `lab`, the
-                saved scenario files are uploaded into `lab.fs`, and `lab_hash` is ignored.
+                one rebuilt from the manifest: each of its devices that appears in the save file gets the
+                saved image or filesystem, every other device option and the topology come from `lab`,
+                the saved scenario files are uploaded into `lab.fs`, and `lab_hash` is ignored.
 
         Returns:
             Kathara.model.Lab: The restored (and redeployed) network scenario.
@@ -558,86 +589,106 @@ class DockerManager(IManager):
         Raises:
             InvocationError: If the archive is not a valid Kathara save file.
         """
-        with tarfile.open(archive_path, "r") as tar:
-            manifest_member = tar.extractfile("manifest.json") if "manifest.json" in tar.getnames() else None
-            if manifest_member is None:
-                raise InvocationError(f"Invalid Kathara save file `{archive_path}`: missing `manifest.json`.")
-            manifest = json.loads(manifest_member.read().decode("utf-8"))
+        restore_dir = None
+        try:
+            with tarfile.open(archive_path, "r") as tar:
+                manifest_member = tar.extractfile("manifest.json") if "manifest.json" in tar.getnames() else None
+                if manifest_member is None:
+                    raise InvocationError(f"Invalid Kathara save file `{archive_path}`: missing `manifest.json`.")
+                manifest = json.loads(manifest_member.read().decode("utf-8"))
+                filesystem_diff = manifest.get("save_mode") == "diff"
 
-            if manifest.get("save_mode") == "diff":
-                self._restore_diff_images(tar, manifest)
-            else:
-                # Load the full committed images. The extracted member is streamed so large images
-                # are not read fully into memory.
+                if not filesystem_diff:
+                    # Load the full committed images. The extracted member is streamed so large images
+                    # are not read fully into memory.
+                    for member in tar.getmembers():
+                        if member.isfile() and member.name.startswith("images/"):
+                            logging.info(f"Loading saved image `{member.name}`... This may take a while.")
+                            self.docker_image.load_images_from_tar(tar.extractfile(member))
+
+                if lab is None:
+                    lab = lab_from_dict(manifest)
+                    if lab_hash:
+                        lab.hash = lab_hash
+                elif not filesystem_diff:
+                    # The caller provides the topology and device options; only the images come from the save file.
+                    self._apply_saved_images(lab, manifest)
+
+                if filesystem_diff:
+                    restore_dir = tempfile.mkdtemp(prefix="kathara_restore_")
+                    self._prepare_diff_restore(tar, manifest, lab, restore_dir)
+
+                # Restore the network scenario files (startup/shutdown/shared/device dirs) into the lab filesystem.
                 for member in tar.getmembers():
-                    if member.isfile() and member.name.startswith("images/"):
-                        logging.info(f"Loading saved image `{member.name}`... This may take a while.")
-                        self.docker_image.load_images_from_tar(tar.extractfile(member))
+                    if member.isfile() and member.name.startswith("lab/"):
+                        dst_path = member.name[len("lab"):]  # keep the leading slash for the fs
+                        parent = os.path.dirname(dst_path)
+                        if parent and parent != "/":
+                            lab.fs.makedirs(parent, recreate=True)
+                        with tar.extractfile(member) as src:
+                            lab.fs.upload(dst_path, src)
 
-            if lab is None:
-                lab = lab_from_dict(manifest)
-                if lab_hash:
-                    lab.hash = lab_hash
-            else:
-                # The caller provides the topology and device options; only the images come from the save file.
-                self._apply_saved_images(lab, manifest)
-
-            # Restore the network scenario files (startup/shutdown/shared/device dirs) into the lab filesystem.
-            for member in tar.getmembers():
-                if member.isfile() and member.name.startswith("lab/"):
-                    dst_path = member.name[len("lab"):]  # keep the leading slash for the fs
-                    parent = os.path.dirname(dst_path)
-                    if parent and parent != "/":
-                        lab.fs.makedirs(parent, recreate=True)
-                    with tar.extractfile(member) as src:
-                        lab.fs.upload(dst_path, src)
-
-        self.deploy_lab(lab)
+            self.deploy_lab(lab)
+        finally:
+            if lab is not None:
+                for machine in lab.machines.values():
+                    machine.meta.pop(RESTORE_DIFF_META, None)
+            if restore_dir is not None:
+                shutil.rmtree(restore_dir, ignore_errors=True)
 
         return lab
 
     @staticmethod
-    def _apply_saved_images(lab: Lab, manifest: Dict) -> None:
-        """Point the devices of `lab` that are in the save file at the restored images."""
-        saved_images = {machine_dict["name"]: machine_dict["meta"]["image"] for machine_dict in manifest["machines"]}
+    def _saved_machines(lab: Lab, manifest: Dict) -> Dict[str, Dict]:
+        """Return the saved devices of `manifest` that are in `lab`, by name, and warn about the others."""
+        saved = {machine_dict["name"]: machine_dict for machine_dict in manifest["machines"]}
 
-        for name, machine in lab.machines.items():
-            if name in saved_images:
-                machine.add_meta("image", saved_images[name])
-            else:
+        for name in lab.machines:
+            if name not in saved:
                 logging.warning(f"Device `{name}` is not in the save file: it will be deployed from its own image.")
 
-        for name in sorted(saved_images.keys() - lab.machines.keys()):
+        for name in sorted(saved.keys() - lab.machines.keys()):
             logging.warning(f"Saved device `{name}` is not in the network scenario: its saved state is ignored.")
 
-    def _restore_diff_images(self, tar: tarfile.TarFile, manifest: Dict) -> None:
-        """Reconstruct each device image from its base image and saved filesystem diff."""
-        machines_by_name = {machine_dict["name"]: machine_dict for machine_dict in manifest["machines"]}
+        return {name: machine_dict for name, machine_dict in saved.items() if name in lab.machines}
 
-        for member in tar.getmembers():
-            if not (member.isfile() and member.name.startswith("images/") and member.name.endswith(".diff.tar")):
-                continue
+    def _apply_saved_images(self, lab: Lab, manifest: Dict) -> None:
+        """Point the devices of `lab` that are in the save file at the restored images."""
+        for name, machine_dict in self._saved_machines(lab, manifest).items():
+            lab.machines[name].add_meta("image", machine_dict["meta"]["image"])
 
-            name = os.path.basename(member.name)[:-len(".diff.tar")]
-            machine_dict = machines_by_name.get(name)
-            if machine_dict is None:
-                continue
+    def _prepare_diff_restore(self, tar: tarfile.TarFile, manifest: Dict, lab: Lab, restore_dir: str) -> None:
+        """Prepare the devices of `lab` that are in a filesystem-diff save file for their deployment.
 
+        Each one is pointed at its base image, or at the base image without the files it had deleted
+        (`DockerImage.build_image_without`), and its diff tarball is extracted into `restore_dir`
+        for `DockerMachine.create` to copy it into the container.
+        """
+        repository = self._save_repository(lab.hash)
+        members = set(tar.getnames())
+
+        for index, (name, machine_dict) in enumerate(sorted(self._saved_machines(lab, manifest).items())):
+            machine = lab.machines[name]
             base_image = machine_dict["original_image"]
-            target_ref = machine_dict["meta"]["image"]
             deletions = machine_dict.get("deletions", [])
 
-            # Ensure the base image is available before reconstructing on top of it.
+            # Ensure the base image is available before anything is built or created on top of it.
             self.docker_image.check_from_list({base_image})
 
-            logging.info(f"Reconstructing image of device `{name}` from base `{base_image}`...")
-            diff_fd, diff_path = tempfile.mkstemp(prefix="kathara_diff_", suffix=".tar")
-            try:
-                with os.fdopen(diff_fd, "wb") as diff_file:
-                    shutil.copyfileobj(tar.extractfile(member), diff_file)
-                self.docker_image.build_image_from_diff(base_image, target_ref, diff_path, deletions)
-            finally:
-                os.remove(diff_path)
+            if deletions:
+                logging.info(f"Building the image of device `{name}` from base `{base_image}`...")
+                image = f"{repository}:{name}"
+                self.docker_image.build_image_without(base_image, image, deletions)
+                machine.add_meta("image", image)
+            else:
+                machine.add_meta("image", base_image)
+
+            member_name = f"images/{name}.diff.tar"
+            if member_name in members:
+                diff_path = os.path.join(restore_dir, f"{index}.diff.tar")
+                with open(diff_path, "wb") as diff_file:
+                    shutil.copyfileobj(tar.extractfile(member_name), diff_file)
+                machine.meta[RESTORE_DIFF_META] = diff_path
 
     def _write_save_archive(self, archive_path: str, lab: Lab, manifest: Dict,
                             committed_images: Dict[str, str], diff_files: Dict[str, str]) -> None:

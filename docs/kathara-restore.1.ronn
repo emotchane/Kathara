@@ -10,7 +10,9 @@ kathara-restore(1) -- Restore a Kathara network scenario previously saved into a
 
 Restore a network scenario previously saved with `kathara-save`(1) and redeploy it, rebuilding the same network.
 
-The committed device images bundled in the save file are loaded into the local Docker repository, the network topology is rebuilt from the save file, and the scenario is deployed from the saved images. As a result, the restored devices come back with the filesystem state they had when they were saved.
+The network topology is rebuilt from the save file and the scenario is deployed with the filesystem state the devices had when they were saved. For a save file made with `--full-images`, the committed device images bundled in the file are loaded into the local Docker repository and the devices are deployed from them. For a filesystem-diff save file (the default of `kathara-save`(1)), each device is deployed from its base image (pulled if necessary) and its saved files are copied into it before it starts; only a device that had deleted files of its base image gets a local image of its own, the base image without them, removed when the scenario is undeployed.
+
+A restored scenario can be saved again: the new save file is still relative to the base images of the devices, so it can be restored on a host that never saw the previous one.
 
 NOTE: This command is only available on the Docker manager.
 
